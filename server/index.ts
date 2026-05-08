@@ -1,18 +1,20 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
 import { z } from "zod";
-import { createClient } from "@supabase/supabase-js";
+import postgres from "postgres";
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const DATABASE_URL = Deno.env.get("DATABASE_URL")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 
+// Local Ollama embedding model — 768-dim, free, on-host.
+// Writes to thoughts.embedding_local and search via match_thoughts_local.
+const OLLAMA_BASE = Deno.env.get("OLLAMA_BASE") ?? "http://127.0.0.1:11434";
+const OLLAMA_EMBED_MODEL = Deno.env.get("OLLAMA_EMBED_MODEL") ?? "nomic-embed-text";
+
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const sql = postgres(DATABASE_URL);
 
 type ThoughtMatch = {
   id: string;
@@ -44,23 +46,20 @@ function thoughtUrl(id: string): string {
 }
 
 async function getEmbedding(text: string): Promise<number[]> {
-  const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+  const r = await fetch(`${OLLAMA_BASE}/api/embeddings`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "openai/text-embedding-3-small",
-      input: text,
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: OLLAMA_EMBED_MODEL, prompt: text }),
   });
   if (!r.ok) {
     const msg = await r.text().catch(() => "");
-    throw new Error(`OpenRouter embeddings failed: ${r.status} ${msg}`);
+    throw new Error(`Ollama embeddings failed: ${r.status} ${msg}`);
   }
   const d = await r.json();
-  return d.data[0].embedding;
+  if (!d.embedding || !d.embedding.length) {
+    throw new Error("Ollama returned empty embedding");
+  }
+  return d.embedding;
 }
 
 async function extractMetadata(text: string): Promise<Record<string, unknown>> {
@@ -225,19 +224,15 @@ server.registerTool(
   async ({ query, limit, threshold }) => {
     try {
       const qEmb = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_thoughts", {
-        query_embedding: qEmb,
-        match_threshold: threshold,
-        match_count: limit,
-        filter: {},
-      });
-
-      if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Search error: ${error.message}` }],
-          isError: true,
-        };
-      }
+      const embStr = `[${qEmb.join(",")}]`;
+      const data = await sql`
+        SELECT * FROM match_thoughts_local(
+          ${embStr}::vector(768),
+          ${threshold}::float,
+          ${limit}::int,
+          '{}'::jsonb
+        )
+      `;
 
       if (!data || data.length === 0) {
         return {
@@ -304,29 +299,22 @@ server.registerTool(
   },
   async ({ limit, type, topic, person, days }) => {
     try {
-      let q = supabase
-        .from("thoughts")
-        .select("content, metadata, created_at")
-        .order("created_at", { ascending: false })
-        .limit(limit);
+      const typeFilter = type != null ? sql`AND metadata @> ${JSON.stringify({ type })}::jsonb` : sql``;
+      const topicFilter = topic != null ? sql`AND metadata @> ${JSON.stringify({ topics: [topic] })}::jsonb` : sql``;
+      const personFilter = person != null ? sql`AND metadata @> ${JSON.stringify({ people: [person] })}::jsonb` : sql``;
+      const since = days != null ? (() => { const d = new Date(); d.setDate(d.getDate() - days); return d; })() : null;
+      const daysFilter = since != null ? sql`AND created_at >= ${since.toISOString()}` : sql``;
 
-      if (type) q = q.contains("metadata", { type });
-      if (topic) q = q.contains("metadata", { topics: [topic] });
-      if (person) q = q.contains("metadata", { people: [person] });
-      if (days) {
-        const since = new Date();
-        since.setDate(since.getDate() - days);
-        q = q.gte("created_at", since.toISOString());
-      }
-
-      const { data, error } = await q;
-
-      if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${error.message}` }],
-          isError: true,
-        };
-      }
+      const data = await sql`
+        SELECT content, metadata, created_at FROM thoughts
+        WHERE true
+        ${typeFilter}
+        ${topicFilter}
+        ${personFilter}
+        ${daysFilter}
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `;
 
       if (!data || !data.length) {
         return { content: [{ type: "text" as const, text: "No thoughts found." }] };
@@ -373,20 +361,14 @@ server.registerTool(
   },
   async () => {
     try {
-      const { count } = await supabase
-        .from("thoughts")
-        .select("*", { count: "exact", head: true });
-
-      const { data } = await supabase
-        .from("thoughts")
-        .select("metadata, created_at")
-        .order("created_at", { ascending: false });
+      const [{ count }] = await sql`SELECT COUNT(*)::int AS count FROM thoughts`;
+      const rows = await sql`SELECT metadata, created_at FROM thoughts ORDER BY created_at DESC`;
 
       const types: Record<string, number> = {};
       const topics: Record<string, number> = {};
       const people: Record<string, number> = {};
 
-      for (const r of data || []) {
+      for (const r of rows) {
         const m = (r.metadata || {}) as Record<string, unknown>;
         if (m.type) types[m.type as string] = (types[m.type as string] || 0) + 1;
         if (Array.isArray(m.topics))
@@ -403,10 +385,10 @@ server.registerTool(
       const lines: string[] = [
         `Total thoughts: ${count}`,
         `Date range: ${
-          data?.length
-            ? new Date(data[data.length - 1].created_at).toLocaleDateString() +
+          rows.length
+            ? new Date(rows[rows.length - 1].created_at).toLocaleDateString() +
               " → " +
-              new Date(data[0].created_at).toLocaleDateString()
+              new Date(rows[0].created_at).toLocaleDateString()
             : "N/A"
         }`,
         "",
@@ -458,30 +440,24 @@ server.registerTool(
         extractMetadata(content),
       ]);
 
-      const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
-        p_content: content,
-        p_payload: { metadata: { ...metadata, source: "mcp" } },
-      });
+      const payload = { metadata: { ...metadata, source: "mcp" } };
+      const [upsertResult] = await sql`
+        SELECT * FROM upsert_thought(${content}, ${JSON.stringify(payload)}::jsonb)
+      `;
 
-      if (upsertError) {
+      if (!upsertResult) {
         return {
-          content: [{ type: "text" as const, text: `Failed to capture: ${upsertError.message}` }],
+          content: [{ type: "text" as const, text: "Failed to capture: upsert returned no result" }],
           isError: true,
         };
       }
 
-      const thoughtId = upsertResult?.id;
-      const { error: embError } = await supabase
-        .from("thoughts")
-        .update({ embedding })
-        .eq("id", thoughtId);
+      const thoughtId = upsertResult.upsert_thought?.id ?? upsertResult.id;
 
-      if (embError) {
-        return {
-          content: [{ type: "text" as const, text: `Failed to save embedding: ${embError.message}` }],
-          isError: true,
-        };
-      }
+      const embStr = `[${embedding.join(",")}]`;
+      await sql`
+        UPDATE thoughts SET embedding_local = ${embStr}::vector(768) WHERE id = ${thoughtId}
+      `;
 
       const meta = metadata as Record<string, unknown>;
       let confirmation = `Captured as ${meta.type || "thought"}`;
@@ -547,4 +523,4 @@ app.all("*", async (c) => {
   return transport.handleRequest(c);
 });
 
-Deno.serve(app.fetch);
+Deno.serve({ port: parseInt(Deno.env.get("PORT") || "8767") }, app.fetch);
