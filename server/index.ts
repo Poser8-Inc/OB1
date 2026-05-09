@@ -120,21 +120,17 @@ server.registerTool(
   async ({ query }) => {
     try {
       const qEmb = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_thoughts", {
-        query_embedding: qEmb,
-        match_threshold: 0.5,
-        match_count: 10,
-        filter: {},
-      });
+      const embStr = `[${qEmb.join(",")}]`;
+      const data = await sql<ThoughtMatch[]>`
+        SELECT * FROM match_thoughts_local(
+          ${embStr}::vector(768),
+          0.5::float,
+          10::int,
+          '{}'::jsonb
+        )
+      `;
 
-      if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Search error: ${error.message}` }],
-          isError: true,
-        };
-      }
-
-      const results = ((data || []) as ThoughtMatch[]).map((t) => ({
+      const results = (data || []).map((t) => ({
         id: t.id,
         title: thoughtTitle(t.content, t.created_at),
         url: thoughtUrl(t.id),
@@ -167,20 +163,21 @@ server.registerTool(
   },
   async ({ id }) => {
     try {
-      const { data, error } = await supabase
-        .from("thoughts")
-        .select("id, content, metadata, created_at, updated_at")
-        .eq("id", id)
-        .single();
+      const rows = await sql<ThoughtRecord[]>`
+        SELECT id, content, metadata, created_at, updated_at
+        FROM thoughts
+        WHERE id = ${id}::uuid
+        LIMIT 1
+      `;
 
-      if (error) {
+      if (!rows || rows.length === 0) {
         return {
-          content: [{ type: "text" as const, text: `Fetch error: ${error.message}` }],
+          content: [{ type: "text" as const, text: `No thought found with id ${id}.` }],
           isError: true,
         };
       }
 
-      const thought = data as ThoughtRecord;
+      const thought = rows[0];
       const document = {
         id: thought.id,
         title: thoughtTitle(thought.content, thought.created_at),
